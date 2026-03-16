@@ -29,6 +29,17 @@ let viewer: Viewer | undefined;
 const activeMenu = ref();
 const checked = ref(true);
 
+// 左键点击实体信息面板
+type ClickedEntityInfo = {
+  id: string;
+  name: string;
+  lng: number;
+  lat: number;
+  height: number;
+};
+const clickedEntityInfo = ref<ClickedEntityInfo | null>(null);
+let leftClickHandler: Cesium.ScreenSpaceEventHandler | null = null;
+
 // 时间播放控制
 const isPlaying = ref(false);
 
@@ -81,6 +92,12 @@ function startTimelineSync() {
     const p = mapTool.calcClockRatioPercent();
     if (p == null) return;
     timelineValue.value = p;
+    // 时间轴走到末尾：自动停止播放，让播放按钮回到“停止/暂停”状态
+    if (p >= 100) {
+      isPlaying.value = false;
+      mapTool.pauseAnimation();
+      timelineValue.value = 100;
+    }
   };
   timelineSyncRaf = window.requestAnimationFrame(tick);
 }
@@ -246,17 +263,21 @@ export interface MovingStationInfo{
   fireRange?: {
     radius: number; // 半径（米）
     color?: Cesium.Color | string; //圆形颜色，默认红色
+    height?: number;
+    name?: string;
   }
   /** 信号源参数 */
   signalSource?: {
     distance: number;  /** 扩散最大距离（米） */
     color?: Cesium.Color | string; //圆形颜色，默认红色
+    height?: number;
+    namePrefix?: string;
   }
   speed?: number; // 运动速度（米/秒），默认 100
   startTime: Date; // 航迹起始时间
   endTime: Date; //航迹结束时间
   imageUrl: string; // 实体贴图路径
-  trackColor: Cesium.Color; // 航迹线颜色，默认红色
+  trackColor?: Cesium.Color | string; // 航迹线颜色，默认红色
   trackWidth: number; // 航迹线宽度 默认2
   labelFont?: string; //标签字体，默认 "12pt 微软雅黑"
 }
@@ -455,7 +476,7 @@ function test(){
         // }
       });
 
-      const movingStationParams: mapTool.MovingStationParams = {
+      const movingStationParams: MovingStationInfo = {
         name: "MQ-9无人机",
         waypoints:[
     {
@@ -1777,13 +1798,23 @@ function test(){
         startTime: startTime,
         endTime: endTime,
         imageUrl: "./img/飞机.svg",
+        trackColor: "rgb(0, 34, 221)",
         trackWidth: 1,
-        labelFont:"12pt 微软雅黑",
+        labelFont:"10pt 微软雅黑",
       }
 
 
       //侦察机运动实体信息
-      const moveingEntity = mapTool.drawMovingStation(movingStationParams);
+      const moveingEntity = mapTool.drawMovingStation({
+        name: movingStationParams.name,
+        waypoints: movingStationParams.waypoints,
+        startTime: movingStationParams.startTime,
+        endTime: movingStationParams.endTime,
+        imageUrl: movingStationParams.imageUrl,
+        trackColor: movingStationParams.trackColor,
+        trackWidth: movingStationParams.trackWidth,
+        labelFont: movingStationParams.labelFont,
+      });
 
       // //绘制能力探测范围(雷达范围)扇形
       // if (movingStationParams.detectionRange && moveingEntity) {
@@ -1835,7 +1866,7 @@ function test(){
 
 
       //航母运动实体信息
-      const carrierMovingStationParams: mapTool.MovingStationParams = {
+      const carrierMovingStationParams: MovingStationInfo = {
         name: "林肯号航空母舰",
         waypoints: [
     {
@@ -2910,7 +2941,16 @@ function test(){
         trackWidth: 1,
         labelFont:"12pt 微软雅黑",
       }
-      const hmEntity = mapTool.drawMovingStation(carrierMovingStationParams);
+      const hmEntity = mapTool.drawMovingStation({
+        name: carrierMovingStationParams.name,
+        waypoints: carrierMovingStationParams.waypoints,
+        startTime: carrierMovingStationParams.startTime,
+        endTime: carrierMovingStationParams.endTime,
+        imageUrl: carrierMovingStationParams.imageUrl,
+        trackColor: carrierMovingStationParams.trackColor,
+        trackWidth: carrierMovingStationParams.trackWidth,
+        labelFont: carrierMovingStationParams.labelFont,
+      });
 
       //火力范围
        if (carrierMovingStationParams.fireRange && hmEntity) {
@@ -2925,8 +2965,9 @@ function test(){
           name: fr.name,
           ownerId: hmEntity.id,
         });
-      }  
+        }  
 
+        //信号源扩散波纹
       if (stationEntity && hmEntity) {
         mapTool.signalSourceInteraction(stationEntity, hmEntity, 1000);
       }
@@ -2956,6 +2997,56 @@ onMounted(() => {
   //初始化鼠标移动事件
   const mousePositionHandler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
   mapTool.mousePosition(mousePositionHandler, viewer);
+
+  //实体高亮
+   const mouseMoveEntityHighlightHandler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
+   mapTool.mouseMoveEntityHighlight(mouseMoveEntityHighlightHandler, viewer);
+
+
+  // 初始化左键点击实体事件：在右侧弹窗显示经纬度和实体信息
+  leftClickHandler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
+  leftClickHandler.setInputAction((click: Cesium.ScreenSpaceEventHandler.PositionedEvent) => {
+    // 绘制航迹模式下左键已被占用，这里不拦截
+    if (isDrawingPath.value) return;
+    if (!viewer) return;
+
+    const pickedObjects = viewer.scene.drillPick(click.position);
+    let pickedBillboardEntity: Cesium.Entity | null = null;
+    for (const picked of pickedObjects) {
+      if (picked && Cesium.defined((picked as any).id)) {
+        const e = (picked as any).id as Cesium.Entity;
+        if (e.billboard) {
+          pickedBillboardEntity = e;
+          break;
+        }
+      }
+    }
+
+    if (!pickedBillboardEntity) {
+      // 点击空白处关闭信息面板
+      clickedEntityInfo.value = null;
+      return;
+    }   
+
+    const time = viewer.clock.currentTime;
+    const posProp: any = pickedBillboardEntity.position;
+    const pos: Cesium.Cartesian3 | undefined =
+      posProp && typeof posProp.getValue === "function"
+        ? posProp.getValue(time)
+        : posProp;
+    if (!pos) {
+      clickedEntityInfo.value = null;
+      return;
+    }
+    const carto = Cesium.Cartographic.fromCartesian(pos);
+    clickedEntityInfo.value = {
+      id: pickedBillboardEntity.id,
+      name: pickedBillboardEntity.name || pickedBillboardEntity.id,
+      lng: Cesium.Math.toDegrees(carto.longitude),
+      lat: Cesium.Math.toDegrees(carto.latitude),
+      height: carto.height ?? 0,
+    };
+  }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 
 
   // 初始化播放倍速为 1x
@@ -2987,6 +3078,10 @@ onBeforeUnmount(() => {
   window.removeEventListener("touchend", endTimelineDrag);
   window.removeEventListener("touchcancel", endTimelineDrag);
   stopTimelineSync();
+  if (leftClickHandler) {
+    leftClickHandler.destroy();
+    leftClickHandler = null;
+  }
 });
 
 
@@ -3023,6 +3118,10 @@ function toggleAllSignalSources() {
 
 function toggleAllDetectionRanges() {
   mapTool.toggleAllDetectionRangesVisible();
+}
+
+function toggleAllFullTrackLines() {
+  mapTool.toggleAllFullTrackLinesVisible();
 }
 
 function togglePlay() {
@@ -3235,6 +3334,23 @@ function sitSceneClick(scene: Scene) {
       </Transition>
     </div>
 
+    <!-- 右侧实体信息弹窗 -->
+    <div v-if="clickedEntityInfo" id="entityInfoPanel">
+      <div class="entity-info-title">{{ clickedEntityInfo.name }}</div>
+      <div class="entity-info-row">
+        <span class="label">经度：</span>
+        <span class="value">{{ clickedEntityInfo.lng.toFixed(6) }}°</span>
+      </div>
+      <div class="entity-info-row">
+        <span class="label">纬度：</span>
+        <span class="value">{{ clickedEntityInfo.lat.toFixed(6) }}°</span>
+      </div>
+      <div class="entity-info-row">
+        <span class="label">高度：</span>
+        <span class="value">{{ clickedEntityInfo.height.toFixed(1) }} m</span>
+      </div>
+    </div>
+
     <div id="menuList">
       <div v-for="item in menuList" :key="item.label" class="menu">
         <div
@@ -3303,8 +3419,8 @@ function sitSceneClick(scene: Scene) {
 
       <div class="switch-group">
         <el-button
-          :type="mapTool.battleRangeVisible ? 'success' : 'info'"
-          :plain="!mapTool.battleRangeVisible"
+          :type="mapTool.battleRangeVisible.value ? 'success' : 'info'"
+          :plain="!mapTool.battleRangeVisible.value"
           size="small"
           @click="toggleAllBattleRanges()"
         >
@@ -3314,8 +3430,8 @@ function sitSceneClick(scene: Scene) {
 
       <div class="switch-group">
         <el-button
-          :type="mapTool.signalSourceVisible ? 'success' : 'info'"
-          :plain="!mapTool.signalSourceVisible"
+          :type="mapTool.signalSourceVisible.value ? 'success' : 'info'"
+          :plain="!mapTool.signalSourceVisible.value"
           size="small"
           @click="toggleAllSignalSources()"
         >
@@ -3325,12 +3441,23 @@ function sitSceneClick(scene: Scene) {
 
       <div class="switch-group">
         <el-button
-          :type="mapTool.detectionRangeVisible ? 'success' : 'info'"
-          :plain="!mapTool.detectionRangeVisible"
+          :type="mapTool.detectionRangeVisible.value ? 'success' : 'info'"
+          :plain="!mapTool.detectionRangeVisible.value"
           size="small"
           @click="toggleAllDetectionRanges()"
         >
           能力探测范围: {{ mapTool.detectionRangeVisible.value==true ? '已开启' : '已关闭' }}
+        </el-button>
+      </div>
+
+      <div class="switch-group">
+        <el-button
+          :type="mapTool.fullTrackLineVisible.value ? 'success' : 'info'"
+          :plain="!mapTool.fullTrackLineVisible.value"
+          size="small"
+          @click="toggleAllFullTrackLines()"
+        >
+          完整航迹线: {{ mapTool.fullTrackLineVisible.value==true ? '已开启' : '已关闭' }}
         </el-button>
       </div>
     </div>
@@ -3620,6 +3747,38 @@ function sitSceneClick(scene: Scene) {
     border-radius: 4px;
     font-size: 14px;
     pointer-events: none;
+  }
+  #entityInfoPanel {
+    position: absolute;
+    top: 80px;
+    right: 10px;
+    z-index: 4;
+    min-width: 220px;
+    padding: 10px 14px;
+    border-radius: 6px;
+    background-color: rgba(0, 0, 0, 0.7);
+    color: #fff;
+    font-size: 12px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  }
+  #entityInfoPanel .entity-info-title {
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 6px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+    padding-bottom: 4px;
+  }
+  #entityInfoPanel .entity-info-row {
+    display: flex;
+    margin: 2px 0;
+  }
+  #entityInfoPanel .entity-info-row .label {
+    width: 48px;
+    color: #ddd;
+  }
+  #entityInfoPanel .entity-info-row .value {
+    flex: 1;
+    word-break: break-all;
   }
 }
 </style>

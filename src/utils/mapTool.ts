@@ -11,6 +11,10 @@ let viewer: Viewer | undefined;
 const starTrackAutoMotionRafByTag = new Map<string, number>();
 // 卫星“点击播放/暂停”运动的全局暂停标记（由 UI 的播放按钮控制）
 let starTrackPlayPaused = true;
+
+//雷达扫描“点击播放/暂停”运动的全局暂停标记
+let detectionPlayPaused = true;
+
 // 地图源类型：'goolmap' | 'othermap'
 export const mapSource = ref<"goolmap" | "othermap">("goolmap");
 // 视图模式：'2D' | '3D'
@@ -56,6 +60,11 @@ let detectionRangeEntities: Cesium.Entity[] = [];
 // 单体（按 ownerId）可见性：右键菜单可独立控制
 const detectionRangeOwnerVisible = new Map<string, boolean>();
 
+/** 静态完整航迹线 全局显示开关（界面按钮控制） */
+export const fullTrackLineVisible = ref(true);
+// 已创建的“静态完整航迹线”实体集合（用于全局显隐）
+let fullTrackLineEntities: Cesium.Entity[] = [];
+
 
 /** 播放/暂停与倍速控制（自定义播放控件使用） */
 export function playAnimation() {
@@ -74,6 +83,7 @@ export function playAnimation() {
   viewer.clock.canAnimate = true;
   // 同时恢复星轨“播放模式”的运动
   starTrackPlayPaused = false;
+  detectionPlayPaused = false;
 }
 
 /** 暂停播放 */
@@ -82,6 +92,7 @@ export function pauseAnimation() {
   viewer.clock.shouldAnimate = false;
   // 同时暂停星轨“播放模式”的运动
   starTrackPlayPaused = true;
+  detectionPlayPaused = true;
 }
 
 /** 设置播放倍速 */
@@ -233,6 +244,18 @@ export function toggleAllDetectionRangesVisible() {
   setAllDetectionRangesVisible(!detectionRangeVisible.value);
 }
 
+/** 设置所有静态完整航迹线是否显示（内部使用） */
+function setAllFullTrackLinesVisible(visible: boolean) {
+  fullTrackLineVisible.value = visible;
+  fullTrackLineEntities.forEach(applyFullTrackLineVisibility);
+  viewer?.scene.requestRender();
+}
+
+/** 切换所有静态完整航迹线显隐（界面按钮用） */
+export function toggleAllFullTrackLinesVisible() {
+  setAllFullTrackLinesVisible(!fullTrackLineVisible.value);
+}
+
 /** 设置“当前右键选中实体”的能力探测范围是否显示（内部使用） */
 function setSelectedDetectionRangeVisible(visible: boolean) {
   if (!selectedEntity.value) return;
@@ -297,6 +320,8 @@ export function initMap(): Viewer | undefined {
     selectionIndicator: false, // 禁用选中实体的指示器
     infoBox: false, // 禁用点击实体弹出的信息框
     navigationInstructionsInitiallyVisible: false, // 禁用导航提示
+    // 核心配置：使用椭球体地形（无地形起伏）
+    terrainProvider: new Cesium.EllipsoidTerrainProvider(),
   });
 
   // 移除默认的 Ion 底图，使用离线底图
@@ -526,6 +551,69 @@ export function rightclickEventWithoutPick(
   }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 }
 
+//鼠标移动，实体高亮
+export function mouseMoveEntityHighlight(handler: Cesium.ScreenSpaceEventHandler,viewer: Viewer){
+  if (!viewer) return;
+  // 记录上一次高亮的实体及其原始样式，用于移出时恢复
+  let lastEntity: Cesium.Entity | null = null;
+  let lastLabelFill: Cesium.Property | undefined;
+  let lastBillboardScale: Cesium.Property | undefined;
+
+  const clearHighlight = () => {
+    if (!lastEntity) return;
+    try {
+      if (lastEntity.label && lastLabelFill) {
+        lastEntity.label.fillColor = lastLabelFill;
+      }
+      if (lastEntity.billboard && lastBillboardScale) {
+        lastEntity.billboard.scale = lastBillboardScale;
+      }
+    } catch {
+      // ignore
+    } finally {
+      lastEntity = null;
+      lastLabelFill = undefined;
+      lastBillboardScale = undefined;
+    }
+  };
+
+  handler.setInputAction((movement: Cesium.ScreenSpaceEventHandler.MotionEvent) => {
+    if (!viewer) return;
+    const picked = viewer.scene.pick(movement.endPosition);
+    const entity = picked && Cesium.defined((picked as any).id) ? ((picked as any).id as Cesium.Entity) : null;
+
+    // 只高亮带贴图的实体（billboard），避免影响多边形/线等
+    const hoverEntity = entity && entity.billboard ? entity : null;
+
+    // 仍在同一个实体上：不重复赋值
+    if (hoverEntity && lastEntity && hoverEntity.id === lastEntity.id) return;
+
+    // 移出旧实体：恢复
+    clearHighlight();
+
+    // 未悬停到目标实体：结束
+    if (!hoverEntity) return;
+
+    // 记录原始值并应用高亮
+    lastEntity = hoverEntity;
+    if (lastEntity.label) {
+      lastLabelFill = lastEntity.label.fillColor as any;
+      lastEntity.label.fillColor = new Cesium.ConstantProperty(Cesium.Color.RED) as any;
+    }
+    if (lastEntity.billboard) {
+      lastBillboardScale = lastEntity.billboard.scale as any;
+      const base =
+        typeof lastBillboardScale?.getValue === "function"
+          ? (lastBillboardScale.getValue(viewer.clock.currentTime) as number | undefined)
+          : undefined;
+      const baseScale = Number.isFinite(base) ? (base as number) : 1;
+      lastEntity.billboard.scale = new Cesium.ConstantProperty(baseScale * 1.8) as any;
+    }
+  }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+}
+
+
+
 
 
 /*
@@ -595,9 +683,6 @@ export function drawFixedStation(options: FixedStationParams): Cesium.Entity | u
  * 运动实体参数
  * @param name 实体名称
  * @param waypoints 航迹点
- * @param detectionRange 能力探测范围(雷达范围)扇形
- * @param fireRange 火力范围(圆形)
- * @param signalSource 信号源扩散波纹
  * @param speed 运动速度（米/秒），默认 100
  * @param startTime 航迹起始时间
  * @param endTime 航迹结束时间
@@ -614,36 +699,12 @@ export interface MovingStationParams{
     lat: number; //纬度
     height: number; //高度(米)，默认 0  
   }[];
-  /** 能力探测范围(雷达范围)扇形：跟随运动实体 */
-  detectionRange?: {
-    radius: number; // 半径（米）
-    startAngle: number; // 起始角（度，相对于正北顺时针）
-    endAngle: number; // 终止角（度，相对于正北顺时针）
-    color?: Cesium.Color | string; //扇形颜色
-    /** 扇形高度（米） */
-    height?: number;
-    /** 实体名称 */
-    name?: string;
-  };
-  /** 火力范围（圆形，常用于配合运动实体展示） */
-  fireRange?: {
-    radius: number;
-    color?: Cesium.Color | string;
-    height?: number;
-    name?: string;
-  };
-  /** 信号源扩散（常用于配合运动实体展示） */
-  signalSource?: {
-    distance: number;
-    color?: Cesium.Color | string;
-    height?: number;
-    namePrefix?: string;
-  };
   speed?: number; // 运动速度（米/秒），默认 100
   startTime: Date; // 航迹起始时间
   endTime: Date; //航迹结束时间
   imageUrl: string; // 实体贴图路径
-  trackColor?: Cesium.Color; // 航迹线颜色，默认红色
+  /** 航迹线颜色，支持 Cesium.Color 或 CSS 字符串（如 "rgb(0, 221, 255)"），默认红色 */
+  trackColor?: Cesium.Color | string;
   trackWidth: number; // 航迹线宽度 默认2
   labelFont?: string; //标签字体，默认 "12pt 微软雅黑"
 }
@@ -667,6 +728,12 @@ export function drawMovingStation(options: MovingStationParams): Cesium.Entity |
   } = options;
   const labelFontLocal = labelFont || "12pt 微软雅黑";
 
+  // 解析航迹线颜色：支持字符串或 Cesium.Color
+  const trackColorValue =
+    typeof trackColor === "string"
+      ? Cesium.Color.fromCssColorString(trackColor)
+      : trackColor;
+
   if (!waypoints?.length) return;
   if (!startTime || !endTime) return;
 
@@ -689,6 +756,12 @@ export function drawMovingStation(options: MovingStationParams): Cesium.Entity |
     interpolationAlgorithm: Cesium.LinearApproximation,
     interpolationDegree: 1,
   });
+  // 关键：当播放时间超出采样区间（startTime~endTime）时，仍保持在边界点上，不让实体消失
+  sampledPosition.forwardExtrapolationType = Cesium.ExtrapolationType.HOLD;
+  sampledPosition.backwardExtrapolationType = Cesium.ExtrapolationType.HOLD;
+  // HOLD 的持续时长：设为无限，避免跑到区间外后又变成 undefined
+  (sampledPosition as any).forwardExtrapolationDuration = Number.POSITIVE_INFINITY;
+  (sampledPosition as any).backwardExtrapolationDuration = Number.POSITIVE_INFINITY;
 
   // 计算每个点的“累计距离占比”，把时间铺满 startTime~endTime
   const distances: number[] = [0];
@@ -732,29 +805,30 @@ export function drawMovingStation(options: MovingStationParams): Cesium.Entity |
       width: trackWidth,
       material: new Cesium.PolylineGlowMaterialProperty({
         glowPower: 0.2,
-        color: trackColor,
+        color: trackColorValue,
       }),
-      // 仅保留历史轨迹，时长与实际运动时长一致，减少长时间段下的绘制开销
+      // 不保留历史轨迹（不显示拖尾）
       leadTime: 0,
-      trailTime: durationSeconds,
+      trailTime: 0,
       // 适中分辨率，兼顾平滑度与性能
       resolution: 60,
     }
   });
 
   // 绘制完整航迹线（静态）
-  viewer.entities.add({
+  const fullTrackEntity = viewer.entities.add({
     name: `${name}-完整航迹线`,
     polyline: {
       positions,
       width: Math.max(1, trackWidth - 1),
-      material: trackColor.withAlpha(0.5),
+      material: trackColorValue.withAlpha(0.5),
       clampToGround: false,
       // 让线在球面上更顺滑（仍以传入点为控制点）
       arcType: Cesium.ArcType.GEODESIC,
       granularity: Cesium.Math.RADIANS_PER_DEGREE,
     }
   });
+  registerFullTrackLineEntity(fullTrackEntity);
 
   // 配置时钟，启动航迹运动（按传入时间段）
   viewer.clock.startTime = startJD;
@@ -769,7 +843,7 @@ export function drawMovingStation(options: MovingStationParams): Cesium.Entity |
 
 
 /**
- * 能力探测范围(雷达范围)扇形参数
+ * 雷达扫描范围扇形参数
  * @param center 扇形中心点（可为静态 Cartesian3、动态 Property 或 Entity）
  * @param radius 半径（米）
  * @param startAngle 起始角（度，相对于正北顺时针）
@@ -792,7 +866,9 @@ export interface DetectionRangeOptions {
   scanEnabled?: boolean;
   /** 扫描一周的周期（秒）。默认 10 秒 */
   scanPeriodSeconds?: number;
-  /** 关联的实体 id（用于显隐/管理） */
+  /** 是否显示扫描最大距离圆形边界（默认显示） */
+  showMaxRadiusCircle?: boolean;
+  /** 关联的实体 id（用于显隐/管理） */ 
   ownerId?: string;
   /** 实体名称 */
   name?: string;
@@ -800,9 +876,9 @@ export interface DetectionRangeOptions {
   height?: number;
 }
 /**
- * 绘制能力探测范围(雷达范围)
- * @param options 能力探测范围(雷达范围)参数
- * @returns 能力探测范围(雷达范围)实体
+ * 雷达扫描范围
+ * @param options 雷达扫描范围参数
+ * @returns 雷达扫描范围实体
  */
 export async function detectionRange(options: DetectionRangeOptions): Promise<void> {
   if (!viewer) return;
@@ -815,6 +891,7 @@ export async function detectionRange(options: DetectionRangeOptions): Promise<vo
     color = Cesium.Color.RED,
     scanEnabled = false,
     scanPeriodSeconds = 10,
+    showMaxRadiusCircle = true,
     ownerId,
     name = "能力探测范围(雷达范围)",
     height = 0,
@@ -897,28 +974,74 @@ export async function detectionRange(options: DetectionRangeOptions): Promise<vo
   const periodMs = seconds * 1000;
   const scanOn = !!scanEnabled && Number.isFinite(periodMs) && periodMs > 0;
   if (isDynamic || scanOn) {
-    // 以“首次回调的时间”为基准，保证初始化时 rotation=0
-    let baseTime: Cesium.JulianDate | undefined;
+    // 使用浏览器的 performance.now() 作为时间基准，让扫描速度不受 Cesium 时钟倍速影响
+    let baseMs: number | undefined;
+    // 暂停时保持当前位置：记录上一次有效的扫描旋转角
+    let lastRotationRad = 0;
     hierarchy = new Cesium.CallbackProperty((time: Cesium.JulianDate | undefined) => {
-      const centerPos = getCenterAtTime(time);
-      if (!centerPos) {
-        return lastCenter ? new Cesium.PolygonHierarchy([lastCenter]) : new Cesium.PolygonHierarchy([]);
-      }
-      let rotationRad = 0;
-      if (scanOn && time) {
-        if (!baseTime) baseTime = Cesium.JulianDate.clone(time);
-        const rawMs = Cesium.JulianDate.secondsDifference(time, baseTime) * 1000;
-        const t = ((rawMs % periodMs) + periodMs) % periodMs;
-        rotationRad = (t / periodMs) * Cesium.Math.TWO_PI;
-      }
-      const pts = buildSectorPoints(centerPos, rotationRad);
-      return new Cesium.PolygonHierarchy(pts);
+        const centerPos = getCenterAtTime(time);
+        if (!centerPos) {
+          return lastCenter ? new Cesium.PolygonHierarchy([lastCenter]) : new Cesium.PolygonHierarchy([]);
+        }
+        let rotationRad = 0;
+        if (scanOn) {
+          const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
+          if (baseMs === undefined) {
+            baseMs = nowMs;
+          }
+          if (!detectionPlayPaused) {
+            const rawMs = nowMs - baseMs;
+            const t = ((rawMs % periodMs) + periodMs) % periodMs;
+            rotationRad = (t / periodMs) * Cesium.Math.TWO_PI;
+            lastRotationRad = rotationRad;
+          } else {
+            // 暂停：保持暂停前的角度
+            rotationRad = lastRotationRad;
+          }
+        }
+        const pts = buildSectorPoints(centerPos, rotationRad);
+        return new Cesium.PolygonHierarchy(pts);
     }, false);
   } else {
     // 静态：直接构建
     const staticCenter = centerPosition as Cesium.Cartesian3;
     const pts = buildSectorPoints(staticCenter, 0);
     hierarchy = new Cesium.PolygonHierarchy(pts);
+  }
+
+  // 如果需要显示最大探测距离的圆形边界，则额外绘制一个圆（随中心移动，但不参与扫描旋转）
+  if (showMaxRadiusCircle) {
+    // 圆心：静态/动态统一处理
+    let circlePosition: Cesium.Cartesian3 | Cesium.Property;
+    if (centerPosition instanceof Cesium.Cartesian3) {
+      circlePosition = centerPosition;
+    } else {
+      circlePosition = new Cesium.CallbackProperty((time: Cesium.JulianDate | undefined) => {
+        return getCenterAtTime(time);
+      }, false) as any;
+    }
+
+    const circleEntity = viewer.entities.add({
+      name: `${name}-最大距离边界`,
+      position: circlePosition as any,
+      properties: {
+        drawShapeFlag: true,
+        drawShapeType: "detection-sector-max-circle",
+        detectionRangeFlag: true,
+        detectionRangeOwnerId: ownerId,
+        detectionRangeFollowFlag: isDynamic,
+      } as any,
+      ellipse: {
+        semiMajorAxis: radius,
+        semiMinorAxis: radius,
+        material: Cesium.Color.TRANSPARENT,
+        outline: true,
+        outlineColor: outlineColorValue,
+        outlineWidth: 1,
+        height,
+      },
+    });
+    if (circleEntity) registerDetectionRangeEntity(circleEntity);
   }
 
   const sectorEntity = viewer.entities.add({
@@ -935,7 +1058,7 @@ export async function detectionRange(options: DetectionRangeOptions): Promise<vo
       material: fillColorValue,
       outline: true,
       outlineColor: outlineColorValue,
-      outlineWidth: 3,
+      outlineWidth: 1,
       height,
     },
   });
@@ -4466,4 +4589,13 @@ function applyDetectionRangeVisibility(entity: Cesium.Entity) {
 function registerDetectionRangeEntity(entity: Cesium.Entity) {
   detectionRangeEntities.push(entity);
   applyDetectionRangeVisibility(entity);
+}
+
+function applyFullTrackLineVisibility(entity: Cesium.Entity) {
+  entity.show = Boolean(fullTrackLineVisible.value);
+}
+
+function registerFullTrackLineEntity(entity: Cesium.Entity) {
+  fullTrackLineEntities.push(entity);
+  applyFullTrackLineVisibility(entity);
 }
