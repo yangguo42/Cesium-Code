@@ -1,0 +1,34 @@
+{
+  "systemTitle": {
+    "name": "数字孪生改造与数字化展示软件",
+    "title": "定位展示系统",
+    "author": ""
+  },
+  "system":[
+    {
+      "id": "1",
+      "label": "menu",
+      "show": true,
+      "children": [
+        {
+          "id": "11",
+          "show": true,
+          "label": "场景管理",
+          "describe": ""
+        },
+        {
+          "id": "12",
+          "show": true,
+          "label": "平台管理",
+          "describe": ""
+        },
+         {
+          "id": "13",
+          "show": true,
+          "label": "态势展示",
+          "describe": ""
+        }
+    ] 
+    }
+  ]
+}

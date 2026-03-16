@@ -1,0 +1,21 @@
+{
+    "type": "FeatureCollection",
+    "features": [
+      {
+        "type": "Feature",
+        "properties": {
+          "name": "北京天安门",
+          "imageUrl": "./img/Tx.png", 
+          "imageWidth": 20, 
+          "imageHeight": 14,
+          "offsetX": 0, 
+          "offsetY": 0, 
+          "desc": "北京市中心地标"
+        },
+        "geometry": {
+          "type": "Point",
+          "coordinates": [116.3974, 39.9088]
+        }
+      }
+    ]
+  }

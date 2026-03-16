@@ -1,0 +1,75 @@
+
+[
+  {
+    "id":"document",
+    "name":"simple",
+    "version":"1.0",
+    "clock":{
+      "interval":"2012-03-15T10:00:00Z/2012-03-16T10:00:00Z",
+      "currentTime":"2012-03-15T10:00:00Z",
+      "multiplier":60,
+      "range":"LOOP_STOP",
+      "step":"SYSTEM_CLOCK_MULTIPLIER"
+    }
+  },
+  {
+    "id":"9927edc4-e87a-4e1f-9b8b-0bfb3b05b227",
+    "name":"Accesses",
+    "description":"List of Accesses"
+  },
+  {
+    "id":"Facility/AGI",
+    "name":"AGI",
+    "availability":"2012-03-15T10:00:00Z/2012-03-16T10:00:00Z",
+    "description":"<!--HTML-->\r\n<p>\r\nAnalytical Graphics, Inc. (AGI) develops commercial modeling and analysis software used by more than 40,000 global space, defense and intelligence professionals. AGI founded Cesium to meet the need for a cross-platform virtual globe with dynamic-data visualization. AGI continues to invest heavily in Cesium's development and facilitate the growth of the user and contributor community.\r\n</p>",
+    "billboard":{
+      "eyeOffset":{
+        "cartesian":[
+          0,0,0
+        ]
+      },
+      "horizontalOrigin":"CENTER",
+      "image":"./img/Tx.png",
+       "width":20,
+      "height": 14,
+      "pixelOffset":{
+        "cartesian2":[
+          0,0
+        ]
+      },
+      "scale":1.5,
+      "show":true,
+      "verticalOrigin":"CENTER"
+    },
+    "label":{
+      "fillColor":{
+        "rgba":[
+          0,255,255,255
+        ]
+      },
+      "font":"12pt Lucida Console",
+      "horizontalOrigin":"LEFT",
+      "outlineColor":{
+        "rgba":[
+          0,0,0,255
+        ]
+      },
+      "outlineWidth":2,
+      "pixelOffset":{
+        "cartesian2":[
+          12,0
+        ]
+      },
+      "show":true,
+      "style":"FILL_AND_OUTLINE",
+      "text":"测控站",
+      "verticalOrigin":"CENTER"
+    },
+    "position":{
+      "cartesian":[
+        -1969105.312224764,5721941.0806930065,2008842.759466386
+      ]
+    }
+  }
+
+]
