@@ -9,6 +9,10 @@ import * as satellite from "satellite.js";
 let viewer: Viewer | undefined;
 // 卫星星历自动/受控运动：每个 tag 对应一个 requestAnimationFrame 循环，避免重复启动
 const starTrackAutoMotionRafByTag = new Map<string, number>();
+// 卫星“受控播放”打印位置：每个 tag 对应一个 onTick 监听移除函数，避免重复监听
+const starTrackLogOnTickRemoverByTag = new Map<string, () => void>();
+// 卫星“受控播放”星历时间范围：每个 tag 对应一个 [start, stop]，用于保证 currentTime 落在星历区间内
+const starTrackPlayRangeByTag = new Map<string, { start: Cesium.JulianDate; stop: Cesium.JulianDate }>();
 // 卫星“点击播放/暂停”运动的全局暂停标记（由 UI 的播放按钮控制）
 let starTrackPlayPaused = true;
 
@@ -69,6 +73,8 @@ let fullTrackLineEntities: Cesium.Entity[] = [];
 /** 播放/暂停与倍速控制（自定义播放控件使用） */
 export function playAnimation() {
   if (!viewer) return;
+  // 播放时关闭 requestRenderMode：减少 “onTick + requestRender” 额外调度开销，提升播放流畅度
+  viewer.scene.requestRenderMode = false;
   // 关键：用 TICK_DEPENDENT 让 currentTime 按“上一帧 + multiplier*dt”推进
   // 避免 SYSTEM_CLOCK_MULTIPLIER 跟随系统时间导致采样区间外/看起来不运动
   viewer.clock.clockStep = Cesium.ClockStep.TICK_DEPENDENT;
@@ -79,6 +85,34 @@ export function playAnimation() {
   if (!Number.isFinite(cur) || cur === 0 || cur === 60) {
     viewer.clock.multiplier = 1;
   }
+
+  // 星轨播放：若 currentTime 不在星历时间范围内，则回到星历起点（只改 currentTime，不改固定 start/stop 区间）
+  // 典型场景：时钟区间固定但 currentTime 停在 stopTime 或在星历区间外，导致卫星一直 clamp 到边界点。
+  if (viewer.clock.currentTime && starTrackPlayRangeByTag.size > 0) {
+    const range = starTrackPlayRangeByTag.values().next().value as
+      | { start: Cesium.JulianDate; stop: Cesium.JulianDate }
+      | undefined;
+    if (range?.start && range?.stop) {
+      const outside =
+        Cesium.JulianDate.lessThan(viewer.clock.currentTime, range.start) ||
+        Cesium.JulianDate.greaterThan(viewer.clock.currentTime, range.stop);
+      if (outside) {
+        viewer.clock.currentTime = range.start.clone();
+      }
+    }
+  }
+
+  // 若当前时间已在区间末尾（或非常接近），点击播放时自动回到起点
+  // 这样卫星/航迹不会因为 clamp 一直停在最后一个采样点
+  if (viewer.clock.startTime && viewer.clock.stopTime && viewer.clock.currentTime) {
+    const atOrAfterStop =
+      Cesium.JulianDate.greaterThanOrEquals(viewer.clock.currentTime, viewer.clock.stopTime) ||
+      Cesium.JulianDate.equalsEpsilon(viewer.clock.currentTime, viewer.clock.stopTime, 0.5);
+    if (atOrAfterStop) {
+      viewer.clock.currentTime = viewer.clock.startTime.clone();
+    }
+  }
+
   viewer.clock.shouldAnimate = true;
   viewer.clock.canAnimate = true;
   // 同时恢复星轨“播放模式”的运动
@@ -90,6 +124,9 @@ export function playAnimation() {
 export function pauseAnimation() {
   if (!viewer) return;
   viewer.clock.shouldAnimate = false;
+  // 暂停后恢复按需渲染：静止时不持续重绘
+  viewer.scene.requestRenderMode = true;
+  viewer.scene.requestRender();
   // 同时暂停星轨“播放模式”的运动
   starTrackPlayPaused = true;
   detectionPlayPaused = true;
@@ -324,16 +361,23 @@ export function initMap(): Viewer | undefined {
     terrainProvider: new Cesium.EllipsoidTerrainProvider(),
   });
 
+  // 性能优化：开启按需渲染（静止时不持续重绘）
+  // 注意：动画/时间推进时仍会在 onTick 里 requestRender，避免不刷新
+  viewer.scene.requestRenderMode = true;
+  (viewer.scene as any).maximumRenderTimeChange = Number.POSITIVE_INFINITY;
+
   // 移除默认的 Ion 底图，使用离线底图
   viewer.imageryLayers.removeAll();
   viewer.imageryLayers.addImageryProvider(offlineImageryProvider);
   viewer.scene.requestRender();
 
-  // 若启用了 requestRenderMode，播放时钟推进不会自动触发渲染；这里兜底在每次 tick 请求渲染
+  // 若启用了 requestRenderMode，播放/时间推进时兜底 requestRender（避免不刷新）
+  // 注意：播放态下会临时关闭 requestRenderMode（见 playAnimation），此处只在 requestRenderMode=true 时触发。
   viewer.clock.onTick.addEventListener(() => {
-    viewer?.scene.requestRender();
+    if (viewer?.scene?.requestRenderMode) {
+      viewer.scene.requestRender();
+    }
   });
-
   // 直接隐藏版权容器（最彻底）
   (viewer.cesiumWidget.creditContainer as HTMLElement).style.display = 'none';
 
@@ -431,13 +475,13 @@ export function mousePosition(handler: Cesium.ScreenSpaceEventHandler, viewer: V
 export function rightclickEvent(handler: Cesium.ScreenSpaceEventHandler,viewer: Viewer){
   if (!viewer) return;
 
-  // 鼠标移动到实体（billboard）上时，显示手型光标
+  // 鼠标移动到实体（billboard / model）上时，显示手型光标
   handler.setInputAction((movement: Cesium.ScreenSpaceEventHandler.MotionEvent) => {
     if (!viewer) return;
     const picked = viewer.scene.pick(movement.endPosition);
     if (picked && Cesium.defined(picked.id)) {
       const entity = picked.id as Cesium.Entity;
-      if (entity.billboard) {
+      if (entity.billboard || (entity as any).model) {
         viewer.canvas.style.cursor = "pointer";
         return;
       }
@@ -473,19 +517,20 @@ export function rightclickEvent(handler: Cesium.ScreenSpaceEventHandler,viewer: 
 
     // 检测是否点击到实体（使用 drillPick，避免 2D 模式下被扩散波纹等图形遮挡）
     const pickedObjects = viewer.scene.drillPick(click.position);
-    let pickedBillboardEntity: Cesium.Entity | null = null;
+    let pickedPickableEntity: Cesium.Entity | null = null;
     for (const picked of pickedObjects) {
       if (picked && Cesium.defined((picked as any).id)) {
         const e = (picked as any).id as Cesium.Entity;
-        if (e.billboard) {
-          pickedBillboardEntity = e;
+        // billboard / model 都视为可交互实体
+        if (e.billboard || (e as any).model) {
+          pickedPickableEntity = e;
           break;
         }
       }
     }
 
-    if (pickedBillboardEntity) {
-      selectedEntity.value = pickedBillboardEntity;
+    if (pickedPickableEntity) {
+      selectedEntity.value = pickedPickableEntity;
         contextMenuX.value = click.position.x;
         contextMenuY.value = click.position.y;
         contextMenuVisible.value = true;
@@ -558,6 +603,9 @@ export function mouseMoveEntityHighlight(handler: Cesium.ScreenSpaceEventHandler
   let lastEntity: Cesium.Entity | null = null;
   let lastLabelFill: Cesium.Property | undefined;
   let lastBillboardScale: Cesium.Property | undefined;
+  let lastModelScale: Cesium.Property | undefined;
+  let lastModelSilhouetteColor: Cesium.Property | undefined;
+  let lastModelSilhouetteSize: Cesium.Property | undefined;
 
   const clearHighlight = () => {
     if (!lastEntity) return;
@@ -568,12 +616,21 @@ export function mouseMoveEntityHighlight(handler: Cesium.ScreenSpaceEventHandler
       if (lastEntity.billboard && lastBillboardScale) {
         lastEntity.billboard.scale = lastBillboardScale;
       }
+      if ((lastEntity as any).model) {
+        const m: any = (lastEntity as any).model;
+        if (m && lastModelScale) m.scale = lastModelScale;
+        if (m && lastModelSilhouetteColor) m.silhouetteColor = lastModelSilhouetteColor;
+        if (m && lastModelSilhouetteSize) m.silhouetteSize = lastModelSilhouetteSize;
+      }
     } catch {
       // ignore
     } finally {
       lastEntity = null;
       lastLabelFill = undefined;
       lastBillboardScale = undefined;
+      lastModelScale = undefined;
+      lastModelSilhouetteColor = undefined;
+      lastModelSilhouetteSize = undefined;
     }
   };
 
@@ -582,8 +639,8 @@ export function mouseMoveEntityHighlight(handler: Cesium.ScreenSpaceEventHandler
     const picked = viewer.scene.pick(movement.endPosition);
     const entity = picked && Cesium.defined((picked as any).id) ? ((picked as any).id as Cesium.Entity) : null;
 
-    // 只高亮带贴图的实体（billboard），避免影响多边形/线等
-    const hoverEntity = entity && entity.billboard ? entity : null;
+    // 仅高亮：billboard 或 3D model，避免影响多边形/线等
+    const hoverEntity = entity && (entity.billboard || (entity as any).model) ? entity : null;
 
     // 仍在同一个实体上：不重复赋值
     if (hoverEntity && lastEntity && hoverEntity.id === lastEntity.id) return;
@@ -609,62 +666,148 @@ export function mouseMoveEntityHighlight(handler: Cesium.ScreenSpaceEventHandler
       const baseScale = Number.isFinite(base) ? (base as number) : 1;
       lastEntity.billboard.scale = new Cesium.ConstantProperty(baseScale * 1.8) as any;
     }
+    // 3D 模型高亮：描边 + 可选轻微放大
+    if ((lastEntity as any).model) {
+      const m: any = (lastEntity as any).model;
+      if (m) {
+        lastModelScale = m.scale as any;
+        const baseScale =
+          typeof lastModelScale?.getValue === "function"
+            ? (lastModelScale.getValue(viewer.clock.currentTime) as number | undefined)
+            : undefined;
+        const baseModelScale = Number.isFinite(baseScale) ? (baseScale as number) : 1;
+        m.scale = new Cesium.ConstantProperty(baseModelScale * 1.1) as any;
+
+        lastModelSilhouetteColor = m.silhouetteColor as any;
+        lastModelSilhouetteSize = m.silhouetteSize as any;
+        m.silhouetteColor = new Cesium.ConstantProperty(Cesium.Color.RED) as any;
+        m.silhouetteSize = new Cesium.ConstantProperty(2) as any;
+      }
+    }
   }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
 }
 
 
-
-
-
-/*
+/**
  * 固定站参数
+ * @param name 名称
  * @param lon 经度
  * @param lat 纬度
  * @param alt 高度(米)，默认 0
- * @param image 图片路径
- * @param name 名称
+ * @param twoDimensional 二维贴图参数
+ * @param threeDimensional 三维模型参数
  * @param labelFont 标签字体，默认 "12pt 微软雅黑"
  */
 export interface FixedStationParams{
+  name: string;
   lon: number; 
   lat: number; 
   alt?: number; 
-  image: string;
-  name: string;
+  /** 二维贴图参数 */
+  twoDimensional?:{
+    /** 贴图路径（本地/网络图片均可） */
+    image?: string;
+  };
+/** 三维模型参数 */
+threeDimensional?:{
+  /** 3D 模型地址（gltf/glb） */
+  modelUrl?: string;
+  /** 3D 模型缩放（默认 1） */
+  modelScale?: number;
+  /** 3D 模型最小像素大小（默认 64，避免太小看不见） */
+  minimumPixelSize?: number;
+  /** 3D 模型最大缩放（默认 5000） */
+  maximumScale?: number;
+  /** 朝向（度）：heading 0=北，顺时针为正 */
+  headingDeg?: number;
+  /** 俯仰（度） */
+  pitchDeg?: number;
+  /** 翻滚（度） */
+  rollDeg?: number;
+  /** 是否播放模型内部动画（默认 false，开启会增加播放时卡顿风险） */
+  runAnimations?: boolean;
+  
+};
   labelFont?: string;
 }
+
 /**
  * 绘制固定站位置
  * @param options 固定站参数
  * @returns 固定站实体
  */
-export function drawFixedStation(options: FixedStationParams): Cesium.Entity | undefined {
+export async function drawFixedStation(options: FixedStationParams): Promise<Cesium.Entity | undefined> {
   if(!viewer) return;
   const {
+    name,
     lon,
     lat,
     alt,
-    image,
-    name,
     labelFont,
   } = options;
+  const twoD = options.twoDimensional || {};
+  const threeD = options.threeDimensional || {};
   const labelFontLocal = labelFont || "12pt 微软雅黑";
   const altLocal = alt ?? 0;
   const center = Cesium.Cartesian3.fromDegrees(lon, lat, altLocal);
+
+  const hasModel = !!threeD.modelUrl;
+  const hasBillboard = !!twoD.image;
+  if (!hasModel && !hasBillboard) return;
+
+  // 异步调度：尽量把重的 glb 解析放到初始化之后的空闲/下一帧，避免阻塞 UI
+  const runAsync = (fn: () => void) => {
+    const w = (typeof window !== "undefined" ? (window as any) : undefined) as any;
+    if (w && typeof w.requestIdleCallback === "function") {
+      w.requestIdleCallback(() => fn(), { timeout: 1500 });
+      return;
+    }
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => fn());
+      return;
+    }
+    setTimeout(() => fn(), 0);
+  };
+
   // 绘制固定站实体
   const stationEntity = viewer.entities.add({
     name,
     position: center,
+    orientation: hasModel
+      ? (() => {
+          const headingDeg = threeD.headingDeg ?? 0;
+          const pitchDeg = threeD.pitchDeg ?? 0;
+          const rollDeg = threeD.rollDeg ?? 0;
+          const hpr = new Cesium.HeadingPitchRoll(
+            Cesium.Math.toRadians(headingDeg),
+            Cesium.Math.toRadians(pitchDeg),
+            Cesium.Math.toRadians(rollDeg)
+          );
+          return Cesium.Transforms.headingPitchRollQuaternion(center, hpr);
+        })()
+      : undefined,
     // 贴图配置（billboard）
-    billboard: {
-      image, // 贴图路径（本地/网络图片均可）
-      width: 30,                // 贴图宽度（像素）
-      height: 30,               // 贴图高度（像素）
-      verticalOrigin: Cesium.VerticalOrigin.CENTER, // 锚点居中
-      horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
-      scale: 1.0,               // 缩放比例
-      color: Cesium.Color.TURQUOISE // 贴图颜色（默认白色，不修改原图）
-    },
+    billboard: !hasModel && hasBillboard
+      ? ({
+          image: twoD.image, // 贴图路径（本地/网络图片均可）
+          width: 30,                // 贴图宽度（像素）
+          height: 30,               // 贴图高度（像素）
+          verticalOrigin: Cesium.VerticalOrigin.CENTER, // 锚点居中
+          horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
+          scale: 1.0,               // 缩放比例
+          color: Cesium.Color.TURQUOISE // 贴图颜色（默认白色，不修改原图）
+        } as any)
+      : undefined,
+    // 若是 3D 模型，先给个轻量占位点（不影响拾取/交互），等空闲时再挂载 model
+    point: hasModel
+      ? ({
+          pixelSize: 6,
+          color: Cesium.Color.YELLOW.withAlpha(0.8),
+          outlineColor: Cesium.Color.BLACK,
+          outlineWidth: 1,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        } as any)
+      : undefined,
     //可选：添加标签
     label: {
       text: name,
@@ -675,6 +818,42 @@ export function drawFixedStation(options: FixedStationParams): Cesium.Entity | u
       outlineWidth: 1
     }
   });
+
+  // 3D 模型：异步挂载（避免同步创建时卡顿）
+  if (hasModel && stationEntity) {
+    runAsync(() => {
+      if (!viewer) return;
+      // 可能已被清理
+      if (!viewer.entities.contains(stationEntity)) return;
+
+      const modelGraphics = new Cesium.ModelGraphics({
+        uri: threeD.modelUrl!,
+        scale:
+          typeof threeD.modelScale === "number" && Number.isFinite(threeD.modelScale)
+            ? threeD.modelScale
+            : 1,
+        minimumPixelSize:
+          typeof threeD.minimumPixelSize === "number" && Number.isFinite(threeD.minimumPixelSize)
+            ? threeD.minimumPixelSize
+            : 64,
+        maximumScale:
+          typeof threeD.maximumScale === "number" && Number.isFinite(threeD.maximumScale)
+            ? threeD.maximumScale
+            : 5000,
+        runAnimations: !!threeD.runAnimations,
+        // 性能：关闭阴影、允许异步与渐进纹理加载
+        shadows: Cesium.ShadowMode.DISABLED as any,
+        incrementallyLoadTextures: true as any,
+        asynchronous: true as any,
+      } as any);
+
+      (stationEntity as any).model = modelGraphics;
+      // 挂载成功后隐藏占位点
+      (stationEntity as any).point = undefined;
+      viewer.scene.requestRender();
+    });
+  }
+
   return stationEntity;
 }
 
@@ -683,13 +862,10 @@ export function drawFixedStation(options: FixedStationParams): Cesium.Entity | u
  * 运动实体参数
  * @param name 实体名称
  * @param waypoints 航迹点
- * @param speed 运动速度（米/秒），默认 100
  * @param startTime 航迹起始时间
  * @param endTime 航迹结束时间
- * @param imageUrl 实体贴图路径
- * @param trackColor 航迹线颜色，默认红色
- * @param trackWidth 航迹线宽度 默认2
- * @param labelFont 标签字体，默认 "12pt 微软雅黑"
+ * @param twoDimensional 二维贴图参数
+ * @param threeDimensional 三维模型参数
  */
 export interface MovingStationParams{
   name: string; // 实体名称
@@ -699,10 +875,30 @@ export interface MovingStationParams{
     lat: number; //纬度
     height: number; //高度(米)，默认 0  
   }[];
-  speed?: number; // 运动速度（米/秒），默认 100
   startTime: Date; // 航迹起始时间
   endTime: Date; //航迹结束时间
-  imageUrl: string; // 实体贴图路径
+  twoDimensional?: {
+    /** 实体贴图路径（billboard） */
+    imageUrl?: string;
+  };
+  threeDimensional?: {
+    /** 3D 模型地址（gltf/glb） */
+    modelUrl?: string;
+    /** 3D 模型缩放（默认 1） */
+    modelScale?: number;
+    /** 3D 模型最小像素大小（默认 64） */
+    minimumPixelSize?: number;
+    /** 3D 模型最大缩放（默认 5000） */
+    maximumScale?: number;
+    /** 朝向（度）：heading 0=北，顺时针为正 */
+    headingDeg?: number;
+    /** 俯仰（度） */
+    pitchDeg?: number;
+    /** 翻滚（度） */
+    rollDeg?: number;
+    /** 是否播放模型内部动画（默认 false，开启会增加播放时卡顿风险） */
+    runAnimations?: boolean;
+  };
   /** 航迹线颜色，支持 Cesium.Color 或 CSS 字符串（如 "rgb(0, 221, 255)"），默认红色 */
   trackColor?: Cesium.Color | string;
   trackWidth: number; // 航迹线宽度 默认2
@@ -714,19 +910,25 @@ export interface MovingStationParams{
  * @param options 运动实体参数
  * @returns 运动实体
  */
-export function drawMovingStation(options: MovingStationParams): Cesium.Entity | undefined {
+export async function drawMovingStation(options: MovingStationParams): Promise<Cesium.Entity | undefined> {
   if(!viewer) return;
   const {
     name,
     waypoints,
     startTime,
     endTime,
-    imageUrl,
     trackColor = Cesium.Color.RED,
     trackWidth = 2,
     labelFont,
   } = options;
   const labelFontLocal = labelFont || "12pt 微软雅黑";
+
+  const twoD = options.twoDimensional || {};
+  const threeD = options.threeDimensional || {};
+
+  const hasModel = !!threeD.modelUrl;
+  const hasBillboard = !!twoD.imageUrl;
+  if (!hasModel && !hasBillboard) return;
 
   // 解析航迹线颜色：支持字符串或 Cesium.Color
   const trackColorValue =
@@ -751,7 +953,7 @@ export function drawMovingStation(options: MovingStationParams): Cesium.Entity |
   );
 
   const sampledPosition = new Cesium.SampledPositionProperty();
-  // 以传入航迹点为基准：线性插值即可（严格点-点连线），不做高阶插值以避免偏离/过冲
+  // 航迹插值：以传入航迹点为基准，使用线性插值（严格点-点连线），避免高阶插值带来的偏离/过冲
   sampledPosition.setInterpolationOptions({
     interpolationAlgorithm: Cesium.LinearApproximation,
     interpolationDegree: 1,
@@ -779,20 +981,67 @@ export function drawMovingStation(options: MovingStationParams): Cesium.Entity |
     sampledPosition.addSample(t, positions[i] ?? Cesium.Cartesian3.ZERO);
   }
 
+  // 朝向：对齐航迹速度方向（动态），并叠加可选的 heading/pitch/roll 偏置
+  const velocityOrientation = new Cesium.VelocityOrientationProperty(sampledPosition);
+  const headingDeg = threeD.headingDeg ?? 0;
+  const pitchDeg = threeD.pitchDeg ?? 0;
+  const rollDeg = threeD.rollDeg ?? 0;
+  const hprOffset = new Cesium.HeadingPitchRoll(
+    Cesium.Math.toRadians(headingDeg),
+    Cesium.Math.toRadians(pitchDeg),
+    Cesium.Math.toRadians(rollDeg)
+  );
+  // CesiumJS 提供 Quaternion.fromHeadingPitchRoll；为避免 TS 版本差异，这里做兼容处理
+  const offsetQuat: Cesium.Quaternion =
+    (Cesium.Quaternion as any).fromHeadingPitchRoll?.(hprOffset) ?? Cesium.Quaternion.IDENTITY;
+
+  const orientationProperty = new Cesium.CallbackProperty((time: Cesium.JulianDate | undefined) => {
+    if (!time) return undefined;
+    const baseQuat = velocityOrientation.getValue(time) as Cesium.Quaternion | undefined;
+    if (!baseQuat) return undefined;
+    if (offsetQuat === Cesium.Quaternion.IDENTITY) return baseQuat;
+    return Cesium.Quaternion.multiply(baseQuat, offsetQuat, new Cesium.Quaternion());
+  }, false);
+
   // 创建运动实体（贴图 + 路径）
   const movingEntity = viewer.entities.add({
     name,
     position: sampledPosition,
-    orientation: new Cesium.VelocityOrientationProperty(sampledPosition),
-    billboard: {
-      image: imageUrl,
-      width: 30,
-      height: 30,
-      verticalOrigin: Cesium.VerticalOrigin.CENTER,
-      horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
-      disableDepthTestDistance: Number.POSITIVE_INFINITY,
-      scale: 1.2
-    },
+    orientation: hasModel ? (orientationProperty as any) : (velocityOrientation as any),
+    // 3D 模型（优先）
+    model: hasModel
+      ? ({
+          uri: threeD.modelUrl!,
+          scale:
+            typeof threeD.modelScale === "number" && Number.isFinite(threeD.modelScale)
+              ? threeD.modelScale
+              : 1,
+          minimumPixelSize:
+            typeof threeD.minimumPixelSize === "number" && Number.isFinite(threeD.minimumPixelSize)
+              ? threeD.minimumPixelSize
+              : 64,
+          maximumScale:
+            typeof threeD.maximumScale === "number" && Number.isFinite(threeD.maximumScale)
+              ? threeD.maximumScale
+              : 5000,
+          runAnimations: !!threeD.runAnimations,
+          // 性能：关闭阴影、允许异步与渐进纹理加载
+          shadows: Cesium.ShadowMode.DISABLED,
+          incrementallyLoadTextures: true,
+          asynchronous: true,
+        } as any)
+      : undefined,
+    billboard: !hasModel && hasBillboard
+      ? ({
+          image: twoD.imageUrl,
+          width: 30,
+          height: 30,
+          verticalOrigin: Cesium.VerticalOrigin.CENTER,
+          horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          scale: 1.2
+        } as any)
+      : undefined,
     label: {
       text: name,
       font: labelFontLocal,
@@ -803,15 +1052,13 @@ export function drawMovingStation(options: MovingStationParams): Cesium.Entity |
     },
     path: {
       width: trackWidth,
-      material: new Cesium.PolylineGlowMaterialProperty({
-        glowPower: 0.2,
-        color: trackColorValue,
-      }),
+      // 性能：Glow 材质开销较大，这里使用纯色材质（更稳更流畅）
+      material: trackColorValue,
       // 不保留历史轨迹（不显示拖尾）
       leadTime: 0,
       trailTime: 0,
       // 适中分辨率，兼顾平滑度与性能
-      resolution: 60,
+      resolution: 120,
     }
   });
 
@@ -901,19 +1148,19 @@ export async function detectionRange(options: DetectionRangeOptions): Promise<vo
   if (!radius || radius <= 0) return;
   if (startAngle === endAngle) return;
 
-  // 颜色处理：填充 0.3 透明度 + 描边不透明
-  const outlineColorValue =
+    // 颜色处理：填充 0.3 透明度 + 描边不透明
+    const outlineColorValue =
     typeof color === "string" ? Cesium.Color.fromCssColorString(color) || Cesium.Color.RED : color;
-  const fillColorValue = outlineColorValue.withAlpha(0.3);
+    const fillColorValue = outlineColorValue.withAlpha(0.3);
 
-  let startRad = Cesium.Math.toRadians(startAngle);
-  let endRad = Cesium.Math.toRadians(endAngle);
-  let sweep = endRad - startRad;
-  if (sweep < 0) sweep += 2 * Math.PI;
+      let startRad = Cesium.Math.toRadians(startAngle);
+      let endRad = Cesium.Math.toRadians(endAngle);
+      let sweep = endRad - startRad;
+      if (sweep < 0) sweep += 2 * Math.PI;
   if (sweep <= 0) return;
 
-  const steps = 64;
-  const step = sweep / steps;
+      const steps = 64;
+      const step = sweep / steps;
 
   // 判断 center 类型，确定是静态还是动态
   let centerPosition: Cesium.Cartesian3 | Cesium.Property;
@@ -948,19 +1195,37 @@ export async function detectionRange(options: DetectionRangeOptions): Promise<vo
   };
 
   // 构建扇形点的函数（rotationRad: 本次扫描额外旋转角）
+  // 说明：此前用 ENU 切平面按米偏移来算点，当 radius 很大（例如 1000km+）会与椭球上的 ellipse 半径出现明显偏差。
+  // 这里改为按“地表距离 + 方位角”计算目标点（大圆近似），让扇形边界与 ellipse 的半径保持一致。
   const buildSectorPoints = (center: Cesium.Cartesian3, rotationRad = 0): Cesium.Cartesian3[] => {
-    const enuFrame = Cesium.Transforms.eastNorthUpToFixedFrame(center);
     const pts: Cesium.Cartesian3[] = [];
     pts.push(center);
+
+    const ellipsoid = Cesium.Ellipsoid.WGS84;
+    const c0 = ellipsoid.cartesianToCartographic(center);
+    if (!c0) return pts;
+    const lat1 = c0.latitude;
+    const lon1 = c0.longitude;
+    // 使用 WGS84 长半轴作为近似球半径
+    const R = ellipsoid.maximumRadius;
+    const angDist = radius / R; // 弧度
+
     for (let i = 0; i <= steps; i++) {
-      const angle = startRad + rotationRad + step * i;
-      const local = new Cesium.Cartesian3(
-        radius * Math.sin(angle), // East
-        radius * Math.cos(angle), // North
-        0
-      );
-      const world = Cesium.Matrix4.multiplyByPoint(enuFrame, local, new Cesium.Cartesian3());
-      pts.push(world);
+      const bearing = startRad + rotationRad + step * i; // 以正北为 0，顺时针为正
+      // 球面正解：由起点(φ1,λ1)、方位角、距离求终点(φ2,λ2)
+      const sinLat1 = Math.sin(lat1);
+      const cosLat1 = Math.cos(lat1);
+      const sinAd = Math.sin(angDist);
+      const cosAd = Math.cos(angDist);
+      const sinLat2 = sinLat1 * cosAd + cosLat1 * sinAd * Math.cos(bearing);
+      const lat2 = Math.asin(Math.min(1, Math.max(-1, sinLat2)));
+      const y = Math.sin(bearing) * sinAd * cosLat1;
+      const x = cosAd - sinLat1 * Math.sin(lat2);
+      const lon2 = lon1 + Math.atan2(y, x);
+
+      // 让点贴在椭球面上（高度由 polygon.height/ellipse.height 统一抬升）
+      const dest = Cesium.Cartesian3.fromRadians(lon2, lat2, 0, ellipsoid);
+      pts.push(dest);
     }
     return pts;
   };
@@ -1000,7 +1265,7 @@ export async function detectionRange(options: DetectionRangeOptions): Promise<vo
           }
         }
         const pts = buildSectorPoints(centerPos, rotationRad);
-        return new Cesium.PolygonHierarchy(pts);
+      return new Cesium.PolygonHierarchy(pts);
     }, false);
   } else {
     // 静态：直接构建
@@ -1018,7 +1283,7 @@ export async function detectionRange(options: DetectionRangeOptions): Promise<vo
     } else {
       circlePosition = new Cesium.CallbackProperty((time: Cesium.JulianDate | undefined) => {
         return getCenterAtTime(time);
-      }, false) as any;
+    }, false) as any;
     }
 
     const circleEntity = viewer.entities.add({
@@ -1046,23 +1311,23 @@ export async function detectionRange(options: DetectionRangeOptions): Promise<vo
 
   const sectorEntity = viewer.entities.add({
     name,
-    properties: {
-      drawShapeFlag: true,
-      drawShapeType: "detection-sector",
-      detectionRangeFlag: true,
+      properties: {
+        drawShapeFlag: true,
+        drawShapeType: "detection-sector",
+        detectionRangeFlag: true,
       detectionRangeOwnerId: ownerId,
       detectionRangeFollowFlag: isDynamic,
-    } as any,
-    polygon: {
+      } as any,
+      polygon: {
       hierarchy: hierarchy as any,
-      material: fillColorValue,
-      outline: true,
-      outlineColor: outlineColorValue,
+        material: fillColorValue,
+        outline: true,
+        outlineColor: outlineColorValue,
       outlineWidth: 1,
       height,
-    },
-  });
-  if (sectorEntity) registerDetectionRangeEntity(sectorEntity);
+      },
+    });
+    if (sectorEntity) registerDetectionRangeEntity(sectorEntity);
 }
 
 
@@ -1076,7 +1341,8 @@ export async function detectionRange(options: DetectionRangeOptions): Promise<vo
  * @param height 圆形高度（可为 number 或动态 Property）
  */
 export interface FireControlRangeCircleOptions {
-  center: Cesium.Cartesian3 | Cesium.Property;
+  /** 圆心位置（可为静态 Cartesian3、动态 Property 或 Entity） */
+  center: Cesium.Cartesian3 | Cesium.Property | Cesium.Entity;
   radius: number; // 半径（米）
   color?: Cesium.Color | string;
   ownerId?: string;
@@ -1100,13 +1366,23 @@ export async function drawFireControlRangeCircle(
   if (!center) return;
   if (!radius || radius <= 0) return;
 
+  // center 支持 Entity：统一转为 position（动态 Property）
+  let centerPosition: Cesium.Cartesian3 | Cesium.Property;
+  if (center instanceof Cesium.Entity) {
+    const pos = (center as any).position as Cesium.Property | undefined;
+    if (!pos) return;
+    centerPosition = pos;
+  } else {
+    centerPosition = center;
+  }
+
   const outlineColorValue =
     typeof color === "string" ? Cesium.Color.fromCssColorString(color) || Cesium.Color.RED : color;
   const fillColorValue = outlineColorValue.withAlpha(0.3);
 
   const rangeEntity = viewer.entities.add({
     name,
-    position: center as any,
+    position: centerPosition as any,
     properties: {
       drawShapeFlag: true,
       drawShapeType: "battleRange-fireControl",
@@ -1298,15 +1574,20 @@ export async function drawSignalRipple(options: SignalRippleOptions): Promise<vo
 }
 
 
-/*信号交互——两个实体间距离小于给定公里数时，绘制虚线连接
- 仅在传入的两个实体之间画线：signalSourceInteraction(e1, e2, 1000)
-*/
+/**
+ * 信号源交互效果
+ * @param e1 信号源实体
+ * @param e2List 目标实体列表
+ * @param maxDistanceKm 最大距离（公里）
+ * @returns 信号源交互效果实体
+ */
 export async function signalSourceInteraction(
   e1: Cesium.Entity,
-  e2: Cesium.Entity,
+  e2List: Cesium.Entity[],
   maxDistanceKm = 1000
 ): Promise<void> {
   if (!viewer) return;
+  if (!Array.isArray(e2List) || e2List.length === 0) return;
 
   // 距离阈值（米）
   const km =
@@ -1328,214 +1609,119 @@ export async function signalSourceInteraction(
     return pos as Cesium.Cartesian3;
   };
 
-  // 位置随时间变化：当距离小于阈值时返回两点，否则返回空数组（不绘制）
-  const positionsProp = new Cesium.CallbackProperty(
-    (time: Cesium.JulianDate | undefined) => {
-      if (!viewer || !time) return [];
+  for (const e2 of e2List) {
+    if (!e2) continue;
 
-      const p1 = getPosAtTime(e1, time);
-      const p2 = getPosAtTime(e2, time);
-      if (!p1 || !p2) return [];
+    // 位置随时间变化：当距离小于阈值时返回两点，否则返回空数组（不绘制）
+    let lastInRangeDistanceMeters: number | null = null;
+    let lastMidpoint: Cesium.Cartesian3 | null = null;
+    const positionsProp = new Cesium.CallbackProperty(
+      (time: Cesium.JulianDate | undefined) => {
+        if (!viewer || !time) return [];
 
-      const dist = Cesium.Cartesian3.distance(p1, p2);
-      if (!isFinite(dist) || dist > maxDistanceMeters) {
-        // 超出给定公里数：不绘制
-        return [];
-      }
+        const p1 = getPosAtTime(e1, time);
+        const p2 = getPosAtTime(e2, time);
+        if (!p1 || !p2) {
+          lastInRangeDistanceMeters = null;
+          lastMidpoint = null;
+          return [];
+        }
 
-      // 小于等于给定公里数：绘制虚线连接
-      return [p1, p2];
-    },
-    false
-  );
+        const dist = Cesium.Cartesian3.distance(p1, p2);
+        if (!isFinite(dist) || dist > maxDistanceMeters) {
+          // 超出给定公里数：不绘制
+          lastInRangeDistanceMeters = null;
+          lastMidpoint = null;
+          return [];
+        }
 
-  const link = viewer.entities.add({
-    name: "signal-source-link",
-    polyline: {
-      positions: positionsProp as any,
-      width: 1,
-      material: new Cesium.PolylineDashMaterialProperty({
-        color: Cesium.Color.RED,
-        // 加长每段的屏幕长度并加大间隔，使虚线效果更明显
-        dashLength: 55,
-        // 4 像素实线 + 12 像素空白（按位图案重复）
-        dashPattern: 0b1111000000000000,
-      }),
-      clampToGround: false,
-      arcType: Cesium.ArcType.GEODESIC,
-    },
-    properties: {
-      signalSourceFlag: true,
-      signalSourceType: "signalSource-link",
-    } as any,
-  });
+        // 小于等于给定公里数：绘制虚线连接
+        lastInRangeDistanceMeters = dist;
+        lastMidpoint = Cesium.Cartesian3.midpoint(p1, p2, new Cesium.Cartesian3());
+        return [p1, p2];
+      },
+      false
+    );
 
-  if (link) {
-    registerSignalSourceEntity(link);
+    const link = viewer.entities.add({
+      name: "signal-source-link",
+      polyline: {
+        positions: positionsProp as any,
+        width: 1,
+        material: new Cesium.PolylineDashMaterialProperty({
+          color: Cesium.Color.RED,
+          // 加长每段的屏幕长度并加大间隔，使虚线效果更明显
+          dashLength: 55,
+          // 4 像素实线 + 12 像素空白（按位图案重复）
+          dashPattern: 0b1111000000000000,
+        }),
+        clampToGround: false,
+        arcType: Cesium.ArcType.GEODESIC,
+      },
+      properties: {
+        signalSourceFlag: true,
+        signalSourceType: "signalSource-link",
+        signalSourceTargetId: (e2 as any).id,
+      } as any,
+    });
+
+    if (link) {
+      registerSignalSourceEntity(link);
+    }
+
+    // 虚线上方显示当前距离（动态文本 + 动态位置）
+    const distanceTextProp = new Cesium.CallbackProperty(() => {
+      if (lastInRangeDistanceMeters == null || !isFinite(lastInRangeDistanceMeters)) return "";
+      const kmVal = lastInRangeDistanceMeters / 1000;
+      // 距离格式：小于 10km 保留 2 位，小于 100km 保留 1 位，否则取整
+      const text =
+        kmVal < 10
+          ? kmVal.toFixed(2)
+          : kmVal < 100
+            ? kmVal.toFixed(1)
+            : String(Math.round(kmVal));
+      return `${text} km`;
+    }, false);
+
+    const distancePosProp = new Cesium.CallbackProperty(() => {
+      return lastMidpoint || undefined;
+    }, false);
+
+    const distanceShowProp = new Cesium.CallbackProperty(() => {
+      return lastMidpoint != null && lastInRangeDistanceMeters != null;
+    }, false);
+
+    const distanceLabel = viewer.entities.add({
+      name: "signal-source-distance",
+      position: distancePosProp as any,
+      label: {
+        text: distanceTextProp as any,
+        font: "12px sans-serif",
+        fillColor: Cesium.Color.YELLOW,
+        outlineColor: Cesium.Color.BLACK,
+        outlineWidth: 2,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        showBackground: true,
+        backgroundColor: Cesium.Color.BLACK.withAlpha(0.6),
+        backgroundPadding: new Cesium.Cartesian2(6, 4),
+        pixelOffset: new Cesium.Cartesian2(0, -12),
+        distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 5_000_000),
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+      show: distanceShowProp as any,
+      properties: {
+        signalSourceFlag: true,
+        signalSourceType: "signalSource-distance",
+        signalSourceTargetId: (e2 as any).id,
+      } as any,
+    });
+
+    if (distanceLabel) {
+      registerSignalSourceEntity(distanceLabel);
+    }
   }
 
   viewer.scene.requestRender();
-}
-
-
-
-
-/**
- * 读取星历文件txt,显示运动轨迹
- * @param options 星历文件参数
- * @returns 星历文件实体
- */
-export interface ReadStarTrackParams {
-  /**
-   * TLE 文本来源：传入 txt 文件路径 / URL（例如 "/tle/star.txt"）
-   */
-  tleUrl: string;
-  /**
-   * 开始时间(北京时间)
-   */
-  startTime: Date;
-  /**
-   * 结束时间(北京时间)
-   */
-  endTime: Date;
-  imgUrl: string; //贴图路径
-  /** 轨道线颜色，默认红色 */
-  color?: Cesium.Color | string;
-}
-
-/**
- * 读取双行根数星历文件txt,根据星历绘制卫星轨道,卫星实体静止
- * @param options 星历文件参数
- * @returns 星历文件实体
- */
-export async function readStarTrack(options: ReadStarTrackParams): Promise<void> {
-  if (!viewer) return;
-  if (!options?.tleUrl) return;
-  if (!options?.startTime || !options?.endTime) return;
-
-  // 1) 读取 TLE 文本内容，并转为数组（去 BOM / trim / 过滤空行）
-  const res = await fetch(options.tleUrl);
-  if (!res.ok) return;
-  const text = await res.text();
-  const tleLines = text
-    .split(/\r?\n/)
-    .map((l) => l.replace(/^\uFEFF/, "").trim())
-    .filter(Boolean);
-  if (!tleLines.length) return;
-
-  // 2) 从文件中解析多颗卫星：name + line1 + line2
-  const tles: { name: string; line1: string; line2: string }[] = [];
-  for (let i = 0; i < tleLines.length; i++) {
-    const l = tleLines[i]!;
-    if (!l.startsWith("1 ")) continue;
-    const l2 = tleLines[i + 1];
-    if (!l2 || !l2.startsWith("2 ")) continue;
-    const prev = i - 1 >= 0 ? tleLines[i - 1]! : "";
-    const name = prev && !prev.startsWith("1 ") && !prev.startsWith("2 ") ? prev : "SAT";
-    tles.push({ name, line1: l, line2: l2 });
-    i++; // skip line2
-  }
-  if (!tles.length) return;
-
-// 3) 逐颗卫星计算 ECEF 采样点（按照传入的开始/结束时间生成整段星历）
-  const results = await Promise.all(
-    tles.map(async (t) => {
-      const r = await calculateECEFRange({
-        tleContent: [t.name, t.line1, t.line2],
-        startTime: options.startTime,
-        endTime: options.endTime,
-      });
-      return { satName: t.name || r.satName || "SAT", nowEcf: r.nowEcf };
-    })
-  );
-
-  const satEphs = results
-    .map((r) => ({
-      satName: r.satName,
-      orbitColor: options.color,
-      ephs: r.nowEcf || [],
-    }))
-    .filter((s) => Array.isArray(s.ephs) && s.ephs.length >= 2);
-  if (!satEphs.length) return;
-
-  // 4) 绘制卫星轨道（圆环）+ 卫星点（静态）
-  drawStarTrackByEphemeris({
-    satEphs,
-    imgUrl: options.imgUrl,
-    tag: "star-track-from-tle",
-  });
-}
-
-/*
-  读取双行根数星历文件 txt，根据开始时间和结束时间生成星历采样点，
- 然后调用 drawStarTrackAutoMotion 让卫星在该时间区间内按星历运动
-（不绑定 Cesium 时钟，不循环）
- * @param options 星历文件参数
- * @returns 星历文件实体
-*/
-export async function readStarTrackAutoMotion(options: ReadStarTrackParams): Promise<void> {
-  if (!viewer) return;
-  if (!options?.tleUrl) return;
-  if (!options?.startTime || !options?.endTime) return;
-
-  // 1) 读取 TLE 文本内容，并转为数组（去 BOM / trim / 过滤空行）
-  const res = await fetch(options.tleUrl);
-  if (!res.ok) return;
-  const text = await res.text();
-  const tleLines = text
-    .split(/\r?\n/)
-    .map((l) => l.replace(/^\uFEFF/, "").trim())
-    .filter(Boolean);
-  if (!tleLines.length) return;
-
-  // 2) 从文件中解析多颗卫星：name + line1 + line2
-  const tles: { name: string; line1: string; line2: string }[] = [];
-  for (let i = 0; i < tleLines.length; i++) {
-    const l = tleLines[i]!;
-    if (!l.startsWith("1 ")) continue;
-    const l2 = tleLines[i + 1];
-    if (!l2 || !l2.startsWith("2 ")) continue;
-    const prev = i - 1 >= 0 ? tleLines[i - 1]! : "";
-    const name = prev && !prev.startsWith("1 ") && !prev.startsWith("2 ") ? prev : "SAT";
-    tles.push({ name, line1: l, line2: l2 });
-    i++; // skip line2
-  }
-  if (!tles.length) return;
-
-  // 3) 逐颗卫星计算 ECEF 采样点（1分钟间隔）
-  const results = await Promise.all(
-    tles.map(async (t) => {
-      const r = await calculateECEFRange({
-        tleContent: [t.name, t.line1, t.line2],
-        startTime: options.startTime,
-        endTime: options.endTime,
-      });
-      return { satName: t.name || r.satName || "SAT", nowEcf: r.nowEcf };
-    })
-  );
-
-  const satEphs = results
-    .map((r) => ({
-      satName: r.satName,
-      orbitColor: options.color,
-      // calculateECEFRange 返回的 t 是毫秒时间戳，这里统一换算为“秒”，
-      // 以匹配 drawStarTrackAutoMotion 中对 t(秒级) 的处理
-      ephs: (r.nowEcf || []).map((p) => ({
-        x: p.x,
-        y: p.y,
-        z: p.z,
-        t: p.t / 1000,
-      })),
-    }))
-    .filter((s) => Array.isArray(s.ephs) && s.ephs.length >= 2);
-  if (!satEphs.length) return;
-
-  // 4) 绘制卫星轨道（圆环）+ 卫星点（根据星历按秒级时间推进，不绑定 Cesium 时钟、不循环）
-  drawStarTrackAutoMotion({
-    satEphs,
-    imgUrl: options.imgUrl,
-    tag: "star-track-auto-from-tle",
-  });
 }
 
 
@@ -1555,7 +1741,7 @@ export interface StarEphemerisParams {
       x: number; //x坐标
       y: number; //y坐标
       z: number; //z坐标
-      t: number; //时间戳(秒)
+      t: number; //时间戳(秒)-UTC时间戳
     }[];
   }[]; //卫星轨道参数
   imgUrl: string; //贴图路径
@@ -1566,7 +1752,6 @@ export interface StarEphemerisParams {
 /**
  * 根据星历绘制卫星轨道,卫星实体静止
  * @param options 卫星轨道参数
- * @returns 卫星轨道实体
  */
 export async function drawStarTrackByEphemeris(
   options: StarEphemerisParams
@@ -1740,19 +1925,51 @@ export async function drawStarTrackByEphemeris(
 
 /**
  * 根据星历绘制卫星圆环轨道，受 Cesium 时钟/时间轴控制运动
- * @param options 星历文件参数
- * @returns 星历文件实体
  */
 export async function drawStarTrackPlayMotion(
   options: StarEphemerisParams
 ): Promise<void> {
   if (!viewer) return;
 
-  const tag = options?.tag || "star-track-auto";
+  const tag = options?.tag || "star-track-play";
   const orbitType = `${tag}-orbit`;
   const satType = `${tag}-sat`;
 
-  // 1) 清理该 tag 旧实体（轨道 + 卫星）
+  // 1.记录该 tag 的星历时间范围（UTC 秒），用于播放时把 currentTime 拉回到可运动区间
+  let globalT0: number | null = null;
+  let globalTN: number | null = null;
+  for (const sat of options.satEphs || []) {
+    const ephsAny: any[] = (sat as any)?.ephs || [];
+    if (!Array.isArray(ephsAny) || ephsAny.length === 0) continue;
+    for (const p of ephsAny) {
+      const tSec = Number(p?.t);
+      if (!isFinite(tSec)) continue;
+      globalT0 = globalT0 == null ? tSec : Math.min(globalT0, tSec);
+      globalTN = globalTN == null ? tSec : Math.max(globalTN, tSec);
+    }
+  }
+  if (globalT0 != null && globalTN != null && isFinite(globalT0) && isFinite(globalTN) && globalTN >= globalT0) {
+    starTrackPlayRangeByTag.set(tag, {
+      start: Cesium.JulianDate.fromDate(new Date(globalT0 * 1000)),
+      stop: Cesium.JulianDate.fromDate(new Date(globalTN * 1000)),
+    });
+  } else {
+    starTrackPlayRangeByTag.delete(tag);
+  }
+
+  //2. 若“未播放/暂停态”且时钟当前时间停在区间末尾，则回到区间起点。
+  // 说明：不修改时钟区间（start/stop），只避免初始显示被 clamp 到星历最后一个点。
+  const clock = viewer.clock;
+  if (!clock.shouldAnimate && clock.startTime && clock.stopTime && clock.currentTime) {
+    const atOrAfterStop =
+      Cesium.JulianDate.greaterThanOrEquals(clock.currentTime, clock.stopTime) ||
+      Cesium.JulianDate.equalsEpsilon(clock.currentTime, clock.stopTime, 0.5);
+    if (atOrAfterStop) {
+      clock.currentTime = clock.startTime.clone();
+    }
+  }
+
+  // 4. 清理该 tag 旧实体（轨道 + 卫星）
   const toRemove: Cesium.Entity[] = [];
   const entities = viewer.entities.values;
   for (let i = 0; i < entities.length; i++) {
@@ -1764,22 +1981,21 @@ export async function drawStarTrackPlayMotion(
       typeProp && typeof typeProp.getValue === "function"
         ? typeProp.getValue(viewer.clock.currentTime)
         : typeProp;
-    if (type === orbitType || type === satType) {
-      toRemove.push(e);
-    }
+    if (type === orbitType || type === satType) toRemove.push(e);
   }
   toRemove.forEach((e) => viewer!.entities.remove(e));
 
-  // 停止旧的自动运动循环
-  const oldRaf = starTrackAutoMotionRafByTag.get(tag);
-  if (typeof oldRaf === "number") {
-    cancelAnimationFrame(oldRaf);
-    starTrackAutoMotionRafByTag.delete(tag);
-  }
-
   const CIRCLE_STEPS = 720;
 
-  // 2) 遍历每一颗卫星：绘制圆环 + 准备运动轨迹
+  // 60 秒一帧：把 currentTime snap 到分钟（UTC）边界，确保与时间滑动块帧率一致
+  const snapTo60s = (time: Cesium.JulianDate): Cesium.JulianDate => {
+    const ms = Cesium.JulianDate.toDate(time).getTime();
+    const sec = Math.floor(ms / 1000);
+    const snappedSec = sec - (sec % 60);
+    return Cesium.JulianDate.fromDate(new Date(snappedSec * 1000));
+  };
+
+  // 5. 遍历每一颗卫星：绘制圆环 + 绑定 SampledPositionProperty 到 Cesium 时钟
   for (const sat of options.satEphs || []) {
     const satName = sat?.satName || "";
     const colorValue = sat?.orbitColor || Cesium.Color.RED;
@@ -1791,7 +2007,7 @@ export async function drawStarTrackPlayMotion(
     const ephsAny: any[] = (sat as any)?.ephs || [];
     if (!Array.isArray(ephsAny) || ephsAny.length < 2) continue;
 
-    // 2.1 预处理星历：按时间戳（秒）排序、过滤非法值
+    // 4.1 预处理星历：按时间戳（秒）排序、过滤非法值
     type EphPoint = { t: number; x: number; y: number; z: number };
     const ephsSorted: EphPoint[] = [...ephsAny]
       .map((p) => ({
@@ -1804,18 +2020,13 @@ export async function drawStarTrackPlayMotion(
       .sort((a, b) => a.t - b.t);
     if (ephsSorted.length < 2) continue;
 
-    // 2.2 将星历点转成 Cartesian3（m），并根据这些点拟合一个圆环轨道
-    const toMeters = (p: EphPoint): Cesium.Cartesian3 => {
-      const mag = Math.sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
-      // 数量级像 km（~7000）则转成 m；像 m（~7e6）则直接用
-      const scale = mag > 0 && mag < 1e5 ? 1000 : 1;
-      return new Cesium.Cartesian3(p.x * scale, p.y * scale, p.z * scale);
-    };
-
-    const pts = ephsSorted.map(toMeters);
+    // 4.2 将星历点转成 Cartesian3（严格使用传入 ephs 的 x/y/z，不做单位猜测/缩放）
+    const toCartesian = (p: EphPoint): Cesium.Cartesian3 =>
+      new Cesium.Cartesian3(p.x, p.y, p.z);
+    const pts = ephsSorted.map(toCartesian);
     if (pts.length < 2) continue;
 
-    // 估算轨道平面法向量 n
+    // 4.3 拟合圆环轨道（与 drawStarTrackByEphemeris 保持一致）
     let n = new Cesium.Cartesian3(0, 0, 0);
     for (let i = 0; i < pts.length - 1; i++) {
       const c = Cesium.Cartesian3.cross(pts[i]!, pts[i + 1]!, new Cesium.Cartesian3());
@@ -1829,13 +2040,11 @@ export async function drawStarTrackPlayMotion(
     }
     n = Cesium.Cartesian3.normalize(n, n);
 
-    // 半径：星历点平均半径
     let sumR = 0;
     for (const p of pts) sumR += Cesium.Cartesian3.magnitude(p);
     const radius = sumR / pts.length;
     if (!isFinite(radius) || radius <= 0) continue;
 
-    // 平面内正交基 u / v
     const pickU = (p: Cesium.Cartesian3): Cesium.Cartesian3 | null => {
       const dot = Cesium.Cartesian3.dot(p, n);
       const proj = Cesium.Cartesian3.subtract(
@@ -1867,7 +2076,7 @@ export async function drawStarTrackPlayMotion(
       );
     }
 
-    // 绘制圆环轨道
+    // 轨道圆环
     viewer.entities.add({
       name: satName ? `${satName}-orbit` : "sat-orbit",
       properties: {
@@ -1879,46 +2088,39 @@ export async function drawStarTrackPlayMotion(
         width: 1.5,
         material: orbitColor.withAlpha(0.9),
         clampToGround: false,
-        // ECEF 空间点不要用 GEODESIC（贴地插值），否则可能出现不显示/异常插值
         arcType: Cesium.ArcType.NONE,
       },
     });
 
-    // 2.3 准备按时间戳（秒级）运动的轨迹（绑定 Cesium 时钟：由 currentTime / 时间轴驱动）
+    // 4.4 绑定 SampledPositionProperty（t 为 UTC 秒）
     const sampledPos = new Cesium.SampledPositionProperty(Cesium.ReferenceFrame.FIXED);
     for (const p of ephsSorted) {
-      // t 为秒级时间戳，这里转成 ms，再转换为 JulianDate
       const jd = Cesium.JulianDate.fromDate(new Date(p.t * 1000));
-      sampledPos.addSample(jd, toMeters(p));
+      sampledPos.addSample(jd, toCartesian(p));
     }
     sampledPos.setInterpolationOptions({
       interpolationDegree: 1,
       interpolationAlgorithm: Cesium.LinearApproximation,
     });
+    // 超出范围时保持边界位置
+    sampledPos.forwardExtrapolationType = Cesium.ExtrapolationType.HOLD;
+    sampledPos.forwardExtrapolationDuration = Number.POSITIVE_INFINITY;
+    sampledPos.backwardExtrapolationType = Cesium.ExtrapolationType.HOLD;
+    sampledPos.backwardExtrapolationDuration = Number.POSITIVE_INFINITY;
 
-    const firstPos = toMeters(ephsSorted[0]!);
-    const t0 = ephsSorted[0]!.t;
-    const tN = ephsSorted[ephsSorted.length - 1]!.t;
-    const t0Date = new Date(t0 * 1000);
-    const tNDate = new Date(tN * 1000);
-    const t0Julian = Cesium.JulianDate.fromDate(t0Date);
-    const tNJulian = Cesium.JulianDate.fromDate(tNDate);
+    const firstPos = toCartesian(ephsSorted[0]!);
+    const t0Julian = Cesium.JulianDate.fromDate(new Date(ephsSorted[0]!.t * 1000));
+    const tNJulian = Cesium.JulianDate.fromDate(new Date(ephsSorted[ephsSorted.length - 1]!.t * 1000));
 
-    // 由 Cesium 时钟 currentTime 决定卫星位置：拖动时间轴 / 播放暂停都会反映在实体位置上
+    // 受 Cesium 时钟驱动：snap 到 60 秒帧，再 clamp 到本卫星星历范围
     const posCb = new Cesium.CallbackProperty((time?: Cesium.JulianDate) => {
       if (!time) return firstPos;
-
-      // 将当前时刻 clamp 到星历时间范围 [t0, tN]
-      let clamped = time;
-      if (Cesium.JulianDate.lessThan(time, t0Julian)) {
-        clamped = t0Julian;
-      } else if (Cesium.JulianDate.greaterThan(time, tNJulian)) {
-        clamped = tNJulian;
-      }
-
-      const p = sampledPos.getValue(clamped);
-      return (p as Cesium.Cartesian3) || firstPos;
+      let t = snapTo60s(time);
+      if (Cesium.JulianDate.lessThan(t, t0Julian)) t = t0Julian;
+      else if (Cesium.JulianDate.greaterThan(t, tNJulian)) t = tNJulian;
+      return (sampledPos.getValue(t) as Cesium.Cartesian3) || firstPos;
     }, false);
+
     const satEntity = viewer.entities.add({
       name: satName || "SAT",
       properties: {
@@ -1947,7 +2149,6 @@ export async function drawStarTrackPlayMotion(
           }
         : undefined,
     });
-
   }
 
   viewer.scene.requestRender();
@@ -1957,7 +2158,6 @@ export async function drawStarTrackPlayMotion(
 /**
  * 根据星历绘制卫星圆环轨道，并按时间戳（秒级）驱动卫星实体运动（不绑定 Cesium 时钟，不循环）
  * @param options 星历文件参数
- * @returns 星历文件实体
  */
 export async function drawStarTrackAutoMotion(
   options: StarEphemerisParams
@@ -2009,7 +2209,7 @@ export async function drawStarTrackAutoMotion(
   for (const sat of options.satEphs || []) {
     const satName = sat?.satName || "";
     const colorValue = sat?.orbitColor || Cesium.Color.RED;
-    const orbitColor =
+  const orbitColor =
       typeof colorValue === "string"
         ? Cesium.Color.fromCssColorString(colorValue) || Cesium.Color.RED
         : (colorValue as Cesium.Color);
@@ -2153,12 +2353,12 @@ export async function drawStarTrackAutoMotion(
         ? {
             text: satName,
             font: "13px sans-serif",
-            fillColor: Cesium.Color.WHITE,
-            outlineColor: Cesium.Color.BLACK,
-            outlineWidth: 2,
-            style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-            pixelOffset: new Cesium.Cartesian2(0, -28),
-            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        fillColor: Cesium.Color.WHITE,
+        outlineColor: Cesium.Color.BLACK,
+        outlineWidth: 2,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        pixelOffset: new Cesium.Cartesian2(0, -28),
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
           }
         : undefined,
     });
@@ -2190,9 +2390,9 @@ export async function drawStarTrackAutoMotion(
 
       for (const m of movers) {
         m.updateCurPos(curT);
-      }
+  }
 
-      viewer.scene.requestRender();
+  viewer.scene.requestRender();
 
       if (ratio >= 1) {
         starTrackAutoMotionRafByTag.delete(tag);
@@ -4500,46 +4700,36 @@ export function setCesiumCurrentTimeByTimelinePercent(
  * @param val 
  */
 export function formatTimelineTooltip(val: number,startText: string,endText: string): string {
-  const parse = (t: string): Date | null => {
-    const m = String(t)
-      .trim()
-      .match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?$/);
-    if (!m) return null;
-    const y = Number(m[1]);
-    const mo = Number(m[2]);
-    const d = Number(m[3]);
-    const hh = Number(m[4]);
-    const mm = Number(m[5]);
-    const ss = Number(m[6]);
-    const dt = new Date(y, mo - 1, d, hh, mm, ss);
-    return Number.isFinite(dt.getTime()) ? dt : null;
-  };
   const pad = (n: number) => String(n).padStart(2, "0");
-  const format = (dt: Date): string =>
-    `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())} ${pad(
-      dt.getHours()
-    )}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
-
-  let start = parse(startText);
-  let end = parse(endText);
-  if (!start || !end) return "";
-
-  // 兜底：如果结束时间早于开始时间，交换一下，避免 tooltip 计算为空导致不显示
-  if (end.getTime() < start.getTime()) {
-    const tmp = start;
-    start = end;
-    end = tmp;
+  // 统一走北京时间字符串 -> UTC(ms) 的解析逻辑，避免本地时区/解析方式不一致导致 tooltip 看起来“按分钟跳”
+  const startMs = parseBjToUtcMs(startText);
+  const endMs = parseBjToUtcMs(endText);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return "";
+  let s = startMs;
+  let e = endMs;
+  if (e < s) {
+    const tmp = s;
+    s = e;
+    e = tmp;
   }
-
-  const total = end.getTime() - start.getTime();
-  if (total === 0) return format(start);
+  const total = e - s;
+  if (total === 0) {
+    const dt = new Date(s + 8 * 60 * 60 * 1000);
+    return `${dt.getUTCFullYear()}-${pad(dt.getUTCMonth() + 1)}-${pad(dt.getUTCDate())} ${pad(
+      dt.getUTCHours()
+    )}:${pad(dt.getUTCMinutes())}:${pad(dt.getUTCSeconds())}`;
+  }
   if (!(total > 0)) return "";
 
   const v = Number(val);
   if (!Number.isFinite(v)) return "";
   const ratio = Math.min(1, Math.max(0, v / 100));
-  const cur = new Date(start.getTime() + total * ratio);
-  return format(cur);
+  const curUtcMs = s + total * ratio;
+  // 以北京时间展示：UTC + 8h，用 UTC getters 避免本地时区影响
+  const dt = new Date(curUtcMs + 8 * 60 * 60 * 1000);
+  return `${dt.getUTCFullYear()}-${pad(dt.getUTCMonth() + 1)}-${pad(dt.getUTCDate())} ${pad(
+    dt.getUTCHours()
+  )}:${pad(dt.getUTCMinutes())}:${pad(dt.getUTCSeconds())}`;
 }
 
 
